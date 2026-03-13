@@ -1,0 +1,12 @@
+Epoch 1 | Train Loss: 0.3937
+Epoch 2 | Train Loss: 0.1496
+Epoch 3 | Train Loss: 0.0812
+Epoch 4 | Train Loss: 0.0216
+Epoch 5 | Train Loss: 0.0145
+Epoch 6 | Train Loss: 0.0193
+Epoch 7 | Train Loss: 0.0105
+Epoch 8 | Train Loss: 0.0056
+Epoch 9 | Train Loss: 0.0241
+Epoch 10 | Train Loss: 0.0007
+Validation Accuracy: 0.9795918367346939
+# the above one is for FAKENEWS Dataset
