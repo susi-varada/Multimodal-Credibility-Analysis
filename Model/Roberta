@@ -1,0 +1,287 @@
+# ============================================================
+# Dual-Encoder RoBERTa with Learned Credibility Head
+# Inputs: source_text, reaction_text, label (0=fake,1=real)
+# ============================================================
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import RobertaTokenizer, RobertaModel, get_linear_schedule_with_warmup
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+from torch.optim import AdamW
+
+
+# ------------------------------------------------------------
+# 1. Load Data
+# ------------------------------------------------------------
+
+CSV_PATH = "/content/drive/MyDrive/new_project/stance/_aug_reaction_level_features.csv"   # <-- change to your file
+df = pd.read_csv(CSV_PATH)
+
+# Ensure required columns exist
+assert{"thread_id","source_text", "reply_text", "veracity"}.issubset(df.columns), \
+    "CSV must contain thread_id, source_text, reply_text, label columns"
+
+df["veracity"] = df["veracity"].astype(str).str.lower().map({"true": 1, "false": 0})
+
+
+# Train/Val split
+train_df, val_df = train_test_split(df, test_size=0.2, shuffle=True, random_state=42, stratify=df["veracity"])
+MODEL_NAME = "roberta-base"
+tokenizer = RobertaTokenizer.from_pretrained(MODEL_NAME)
+
+MAX_LEN_SOURCE = 256
+MAX_LEN_REACTION = 256
+BATCH_SIZE = 8
+EPOCHS = 4
+LR = 2e-5
+LAMBDA_CRED = 0.3   # weight for credibility loss
+
+class SourceReactionDataset(Dataset):
+    def __init__(self, df, tokenizer, max_len_source, max_len_reaction):
+        self.df = df.reset_index(drop=True)
+        self.tokenizer = tokenizer
+        self.max_len_source = max_len_source
+        self.max_len_reaction = max_len_reaction
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        source = str(row["source_text"])
+        reaction = str(row["reply_text"])
+        label = int(row["veracity"])
+
+        enc_source = self.tokenizer(
+            source,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_len_source,
+            return_tensors="pt"
+        )
+
+        enc_reaction = self.tokenizer(
+            reaction,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_len_reaction,
+            return_tensors="pt"
+        )
+
+        return {
+            "input_ids_source": enc_source["input_ids"].squeeze(0),
+            "attention_mask_source": enc_source["attention_mask"].squeeze(0),
+            "input_ids_reaction": enc_reaction["input_ids"].squeeze(0),
+            "attention_mask_reaction": enc_reaction["attention_mask"].squeeze(0),
+            "labels": torch.tensor(label, dtype=torch.long),
+        }
+
+train_dataset = SourceReactionDataset(train_df, tokenizer, MAX_LEN_SOURCE, MAX_LEN_REACTION)
+val_dataset = SourceReactionDataset(val_df, tokenizer, MAX_LEN_SOURCE, MAX_LEN_REACTION)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+class DualEncoderWithCredibility(nn.Module):
+    def __init__(self,
+                 model_name="roberta-base",
+                 fusion_hidden_size=256,
+                 dropout_prob=0.1):
+        super().__init__()
+
+        # Shared encoder for simplicity; you can also use 2 separate encoders
+        self.roberta = RobertaModel.from_pretrained(model_name)
+
+        self.dropout = nn.Dropout(dropout_prob)
+
+        # CLS embeddings: 768 (source) + 768 (reaction) + 1 (credibility scalar)
+        fusion_input_dim = 768 + 768 + 1
+
+        # Credibility head: from reaction CLS -> scalar
+        self.cred_head = nn.Linear(768, 1)  # raw logit; sigmoid applied later
+
+        # Fusion + classification head
+        self.fusion = nn.Linear(fusion_input_dim, fusion_hidden_size)
+        self.activation = nn.GELU()
+        self.classifier = nn.Linear(fusion_hidden_size, 2)  # fake/real
+
+        # Losses
+        self.loss_fake = nn.CrossEntropyLoss()
+        self.loss_cred = nn.BCEWithLogitsLoss()  # expects logits and float labels
+
+    def forward(self,
+                input_ids_source,
+                attention_mask_source,
+                input_ids_reaction,
+                attention_mask_reaction,
+                labels=None,
+                lambda_cred=0.3):
+
+        # Encode source
+        out_source = self.roberta(
+            input_ids=input_ids_source,
+            attention_mask=attention_mask_source
+        )
+        cls_source = out_source.last_hidden_state[:, 0, :]  # (batch, 768)
+
+        # Encode reactions
+        out_reaction = self.roberta(
+            input_ids=input_ids_reaction,
+            attention_mask=attention_mask_reaction
+        )
+        cls_reaction = out_reaction.last_hidden_state[:, 0, :]  # (batch, 768)
+
+        cls_source = self.dropout(cls_source)
+        cls_reaction = self.dropout(cls_reaction)
+
+        # ---- Credibility head (learned from reaction CLS) ----
+        cred_logits = self.cred_head(cls_reaction)        # (batch, 1)
+        # cred_score = torch.sigmoid(cred_logits)         # used only for fusion; keep logits for loss
+
+        # For fusion we can use sigmoid(cred_logits) as a bounded scalar
+        cred_score = torch.sigmoid(cred_logits)           # (batch, 1)
+
+        # ---- Fusion for fake/real classification ----
+        fused = torch.cat([cls_source, cls_reaction, cred_score], dim=1)  # (batch, 768+768+1)
+
+        z = self.activation(self.fusion(fused))
+        z = self.dropout(z)
+        logits_fake = self.classifier(z)                  # (batch, 2)
+
+        outputs = {
+            "logits_fake": logits_fake,
+            "cred_logits": cred_logits,
+            "cred_score": cred_score
+        }
+
+        if labels is not None:
+            # Fake/real loss
+            loss_f = self.loss_fake(logits_fake, labels)
+
+            # Weak supervision: use label as proxy for credibility
+            labels_float = labels.float().unsqueeze(1)    # (batch, 1)
+            loss_c = self.loss_cred(cred_logits, labels_float)
+
+            loss = loss_f + lambda_cred * loss_c
+            outputs["loss"] = loss
+            outputs["loss_fake"] = loss_f
+            outputs["loss_cred"] = loss_c
+
+        return outputs
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = DualEncoderWithCredibility(model_name=MODEL_NAME).to(device)
+
+optimizer = AdamW(model.parameters(), lr=LR, weight_decay=0.01)
+
+total_steps = len(train_loader) * EPOCHS
+scheduler = get_linear_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=int(0.1 * total_steps),
+    num_training_steps=total_steps
+)
+
+                      device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = DualEncoderWithCredibility(model_name=MODEL_NAME).to(device)
+
+optimizer = AdamW(model.parameters(), lr=LR, weight_decay=0.01)
+
+total_steps = len(train_loader) * EPOCHS
+scheduler = get_linear_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=int(0.1 * total_steps),
+    num_training_steps=total_steps
+)
+
+                                            print("\n========== TRAINING STARTED ==========\n")
+
+for epoch in range(EPOCHS):
+    model.train()
+    total_loss = 0.0
+    total_fake_loss = 0.0
+    total_cred_loss = 0.0
+
+    for batch in train_loader:
+        input_ids_source = batch["input_ids_source"].to(device)
+        attention_mask_source = batch["attention_mask_source"].to(device)
+        input_ids_reaction = batch["input_ids_reaction"].to(device)
+        attention_mask_reaction = batch["attention_mask_reaction"].to(device)
+        labels = batch["labels"].to(device)
+
+        optimizer.zero_grad()
+
+        outputs = model(
+            input_ids_source=input_ids_source,
+            attention_mask_source=attention_mask_source,
+            input_ids_reaction=input_ids_reaction,
+            attention_mask_reaction=attention_mask_reaction,
+            labels=labels,
+            lambda_cred=LAMBDA_CRED
+        )
+
+        loss = outputs["loss"]
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        scheduler.step()
+
+        total_loss += loss.item()
+        total_fake_loss += outputs["loss_fake"].item()
+        total_cred_loss += outputs["loss_cred"].item()
+
+    avg_total = total_loss / len(train_loader)
+    avg_fake = total_fake_loss / len(train_loader)
+    avg_cred = total_cred_loss / len(train_loader)
+
+    print(f"Epoch {epoch+1}/{EPOCHS} | "
+          f"Total Loss: {avg_total:.4f} | Fake Loss: {avg_fake:.4f} | Cred Loss: {avg_cred:.4f}")
+
+print("\n========== TRAINING COMPLETE ==========\n")
+batch = next(iter(train_loader))
+print(batch.keys())
+
+                                            # ------------------------------------------------------------
+# 7. Validation
+# ------------------------------------------------------------
+
+model.eval()
+all_labels, all_preds = [], []
+all_cred_scores = []
+
+with torch.no_grad():
+    for batch in val_loader:
+        input_ids_source = batch["input_ids_source"].to(device)
+        attention_mask_source = batch["attention_mask_source"].to(device)
+        input_ids_reaction = batch["input_ids_reaction"].to(device)
+        attention_mask_reaction = batch["attention_mask_reaction"].to(device)
+        labels = batch["labels"].to(device)
+
+        outputs = model(
+            input_ids_source=input_ids_source,
+            attention_mask_source=attention_mask_source,
+            input_ids_reaction=input_ids_reaction,
+            attention_mask_reaction=attention_mask_reaction,
+            labels=None
+        )
+
+        logits_fake = outputs["logits_fake"]
+        preds = torch.argmax(logits_fake, dim=1)
+
+        all_labels.extend(labels.cpu().numpy())
+        all_preds.extend(preds.cpu().numpy())
+        all_cred_scores.extend(outputs["cred_score"].cpu().numpy().flatten())
+
+print("Fake News Classification Report (Dual Encoder + Learned Credibility):")
+print(classification_report(all_labels, all_preds, target_names=["fake", "real"]))
+
+# Optional: You can inspect average credibility score for fake vs real
+import numpy as np
+fake_scores = [s for s, y in zip(all_cred_scores, all_labels) if y == 0]
+real_scores = [s for s, y in zip(all_cred_scores, all_labels) if y == 1]
+
+print(f"\nAvg credibility score for fake threads: {np.mean(fake_scores):.3f}")
+print(f"Avg credibility score for real threads: {np.mean(real_scores):.3f}")
+
+                                            
